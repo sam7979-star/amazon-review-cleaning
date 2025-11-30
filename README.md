@@ -130,7 +130,7 @@ Used:
 
 **_✔ 2.2 Filtering known corrupted product_id_**
 
-Using your manually identified 59 product_ids:
+Manually identified 59 product_ids:
 
 df_clean = df.filter(~col("product_id").isin(problem_ids))
 
