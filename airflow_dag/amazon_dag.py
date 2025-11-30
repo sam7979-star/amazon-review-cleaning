@@ -3,22 +3,24 @@ from airflow.operators.python import PythonOperator
 from datetime import datetime
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, when, length, trim, lower, udf, count
-from pyspark.sql.types import StringType
+from pyspark.sql.types import StringType, StructType, StructField, DoubleType
+import shutil, os
+
+# Import clean_review()
 from utils.transformations import clean_review
 
-spark = SparkSession.builder.appName("amazon_pipeline").getOrCreate()
 
-problem_ids = [
-    "B088Z1YWBC","B0BLV1GNLN","B0BF57RN3K","B0B5LVS732","B09V12K8NT",
-    "B09NVPSCQT","B0BF54972T","B0BF563HB4","B0BF4YBLPX","B0B3N7LR6K",
-    "B09ZQK9X8G","B0BF54LXW6","B09PNKXSKF","B07WDKLRM4","B0BP18W8TM",
-    "B07WHQWXL7","B09FKDH6FS","B07WGPKTS4","B097R25DP7","B09V17S2BG",
-    "B0BNV7JM5Y","B0B53QFZPY","B07WGPKMP5","B09PLFJ7ZW","B0B53NXFFR",
-    "B0949SBKMP","B0B53QLB9H","B0BMVWKZ8G","B0B5GF6DQD","B09YV463SW",
-    "B0BNVBJW2S","B09BNXQ6BR","B0B2X35B1K","B09YV42QHZ","B09NVPJ3P4",
-    "B0B3NDPCS9","B0BNXFDTZ2","B0B2RBP83P","B08S74GTBT"
-]
+# ------------------------------------------------------------------------------------
+# Spark Session 
+# ------------------------------------------------------------------------------------
+spark = SparkSession.builder \
+    .appName("amazon_cleaning_pipeline") \
+    .getOrCreate()
 
+
+# ------------------------------------------------------------------------------------
+# Schema 
+# ------------------------------------------------------------------------------------
 schema = StructType([
     StructField("product_id", StringType(), True),
     StructField("product_name", StringType(), True),
@@ -35,39 +37,45 @@ schema = StructType([
     StructField("review_title", StringType(), True),
     StructField("review_content", StringType(), True),
     StructField("img_link", StringType(), True),
-    StructField("product_link", StringType(), True),
+    StructField("product_link", StringType(), True)
 ])
+
+
+# ------------------------------------------------------------------------------------
+# STEP 1 – BRONZE → SILVER
+# Reads the raw Amazon CSV from Bronze and writes cleaned structure to Silver
+# ------------------------------------------------------------------------------------
 def bronze_to_silver():
     df = (
         spark.read.format("csv")
-        .option("header", True)
         .schema(schema)
+        .option("header", True)
         .option("multiLine", True)
         .option("quote", '"')
         .option("escape", '"')
         .load("/Volumes/poc_amazon/bronze/src/amazon.csv")
     )
 
-    df_problem = df.filter(col("product_id").isin(problem_ids))
-    df_clean = df.filter(~col("product_id").isin(problem_ids))
+    # Write directly to Silver
+    df.write.mode("overwrite").option("header", True).csv("/Volumes/poc_amazon/silver/clean_dataset/")
 
-    df_problem.write.mode("overwrite").option("header", True).csv("/Volumes/poc_amazon/bronze/problem_rows/")
-    df_clean.write.mode("overwrite").option("header", True).csv("/Volumes/poc_amazon/silver/clean_dataset/")
 
+# ------------------------------------------------------------------------------------
+# STEP 2 – SILVER → GOLD
+# ------------------------------------------------------------------------------------
 def silver_to_gold():
-    df = spark.read.option("header", True).csv("/Volumes/poc_amazon/silver/clean_dataset/")
-
-    clean_udf = udf(clean_review, StringType())
-    df = df.withColumn("review_content", clean_udf(col("review_content")))
-
-    df = df.filter(
-        col("review_content").isNotNull() &
-        (length(trim(col("review_content"))) > 0) &
-        (~lower(trim(col("review_content"))).isin("nan", "none", "null", "n/a"))
+    df = (
+        spark.read.format("csv")
+        .schema(schema)
+        .option("header", True)
+        .load("/Volumes/poc_amazon/silver/clean_dataset/")
     )
 
-    # Drop duplicates (Silver layer rule)
-    df = df.dropDuplicates(["user_id", "product_id", "review_content", "rating"])
+    # Register UDF
+    clean_udf = udf(clean_review, StringType())
+
+    # Apply cleaning on review_content
+    df = df.withColumn("review_content", clean_udf(col("review_content")))
 
     # Sentiment column
     df = df.withColumn(
@@ -78,22 +86,65 @@ def silver_to_gold():
         .when(col("rating") >= 4.0, "positive")
     )
 
+    # Data Quality Checks
+    df = df.filter(
+        col("review_content").isNotNull() &
+        (length(trim(col("review_content"))) > 0) &
+        (~lower(trim(col("review_content"))).isin("null", "none", "nan", "n/a"))
+    )
+
+    # Drop duplicates
+    df = df.dropDuplicates(["user_id", "product_id", "review_content", "rating"])
+
+    # Rename column
     df = df.withColumnRenamed("review_content", "review_body")
+
+    # Final selection
     df_final = df.select("review_body", "sentiment")
 
-    # Drop duplicate reviews again (Gold Layer rule)
+    # Drop duplicates in final output
     df_final = df_final.dropDuplicates(["review_body"])
 
-    df_final.write.mode("overwrite").option("header", True).csv("/Volumes/poc_amazon/gold/training_dataset/")
+    # TEMP OUTPUT
+    temp_path = "/Volumes/poc_amazon/gold/output/training_dataset_temp/"
 
+    df_final.coalesce(1).write.mode("overwrite").option("header", True).csv(temp_path)
+
+    # Move & rename part file to training_dataset.csv
+    src_folder = temp_path.replace("dbfs:", "/dbfs")
+    target_folder = "/dbfs/Volumes/poc_amazon/gold/output/training_dataset/"
+    target_filename = "training_dataset.csv"
+
+    os.makedirs(target_folder, exist_ok=True)
+
+    for file in os.listdir(src_folder):
+        if file.startswith("part-") and file.endswith(".csv"):
+            shutil.move(
+                os.path.join(src_folder, file),
+                os.path.join(target_folder, target_filename)
+            )
+            break
+
+
+# ------------------------------------------------------------------------------------
+# DAG Definition
+# ------------------------------------------------------------------------------------
 with DAG(
     dag_id="amazon_cleaning_pipeline",
-    start_date=datetime(2025,1,1),
+    start_date=datetime(2025, 1, 1),
     schedule_interval=None,
-    catchup=False
+    catchup=False,
+    default_args={"owner": "sam"}
 ) as dag:
 
-    t1 = PythonOperator(task_id="bronze_to_silver", python_callable=bronze_to_silver)
-    t2 = PythonOperator(task_id="silver_to_gold", python_callable=silver_to_gold)
+    t1 = PythonOperator(
+        task_id="bronze_to_silver",
+        python_callable=bronze_to_silver
+    )
+
+    t2 = PythonOperator(
+        task_id="silver_to_gold",
+        python_callable=silver_to_gold
+    )
 
     t1 >> t2
